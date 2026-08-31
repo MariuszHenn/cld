@@ -1,0 +1,411 @@
+#!/usr/bin/env sh
+# cld - one Claude Code account per terminal, and per project.
+#
+# This is the core CLI. It never changes the environment of your shell.
+# `cld use`, and switching on cd, are handled by the shell integration in
+# shell/cld.{bash,fish,ps1}, which wraps this script.
+
+set -eu
+
+CLD_VERSION="1.0.0"
+CLD_HOME="${CLD_HOME:-$HOME/.cld}"
+CLD_PROFILES_DIR="$CLD_HOME/profiles"
+CLD_DEFAULT_FILE="$CLD_HOME/default"
+CLD_MARKER=".cldrc"
+
+die() { printf 'cld: %s\n' "$1" >&2; exit 1; }
+
+# A leading '-' would make the name look like an option to anything that ever
+# takes it unquoted. Nothing here does today; this keeps it that way.
+valid_name() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    .|..|-*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+profile_dir() { printf '%s/%s\n' "$CLD_PROFILES_DIR" "$1"; }
+# umask only applies while CREATING, so chmod too: an install that predates
+# this, or a $CLD_HOME the installer made first, would stay world-readable
+# forever otherwise.
+mkdir_private() { (umask 077 && mkdir -p "$1") && chmod 700 "$1" 2>/dev/null || true; }
+# valid_name first: it keeps "../.." and other traversal out of every path
+# built from a profile name, cmd_remove's rm -rf included.
+profile_exists() { valid_name "$1" && [ -d "$(profile_dir "$1")" ]; }  # -d follows symlinks
+
+# Where the repo is. $0 is usually a symlink on PATH (~/.local/bin/cld), so
+# walk the links until we reach the real script, then take its parent.
+repo_root() {
+  self="$0"
+  n=0
+  while [ -L "$self" ]; do
+    n=$((n + 1))
+    [ "$n" -gt 40 ] && break
+    target="$(readlink "$self")"
+    case "$target" in
+      /*) self="$target" ;;
+      *)  self="$(dirname "$self")/$target" ;;
+    esac
+  done
+  cd "$(dirname "$self")/.." && pwd -P
+}
+
+# First run: adopt the Claude setup you already have as a profile called
+# "default". It is linked, not copied, so it stays your live setup.
+#
+# One wrinkle: without CLAUDE_CONFIG_DIR, Claude keeps its main config at
+# ~/.claude.json, OUTSIDE ~/.claude. With CLAUDE_CONFIG_DIR set it looks for
+# <dir>/.claude.json instead. So we also link that file into place, or the
+# adopted profile would start with no MCP servers. Claude writes through the
+# link, so both paths stay the same file.
+bootstrap() {
+  # The sentinel is the profiles directory, NOT $CLD_HOME. The installer clones
+  # the source into $CLD_HOME/src, so $CLD_HOME exists before the first run.
+  [ -d "$CLD_PROFILES_DIR" ] && return 0
+  mkdir_private "$CLD_PROFILES_DIR"
+
+  existing="${CLD_ADOPT:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
+  linked=0
+  if [ -d "$existing" ] && ln -s "$existing" "$CLD_PROFILES_DIR/default" 2>/dev/null; then
+    linked=1
+  else
+    mkdir_private "$CLD_PROFILES_DIR/default"
+  fi
+  printf 'default\n' > "$CLD_DEFAULT_FILE"
+
+  if [ "$linked" = "1" ] && [ ! -e "$existing/.claude.json" ]; then
+    outer="${CLD_ADOPT_JSON:-$HOME/.claude.json}"
+    if [ -f "$outer" ]; then
+      # cp does not preserve the source mode, it creates under the umask, and
+      # this file names your account and every MCP server you run.
+      ln -s "$outer" "$existing/.claude.json" 2>/dev/null \
+        || { (umask 077 && cp "$outer" "$existing/.claude.json") 2>/dev/null \
+             && chmod 600 "$existing/.claude.json" 2>/dev/null; } || true
+    fi
+  fi
+
+  printf 'cld: first run. Your current Claude setup is now the "default" profile.\n' >&2
+  if [ "$linked" = "1" ]; then
+    printf 'cld: it points at %s. Nothing was copied or moved.\n' "$existing" >&2
+    printf 'cld: settings, skills and MCP servers carry over. The login does not:\n' >&2
+    printf 'cld: Claude keys credentials to the config directory. Run claude once\n' >&2
+    printf 'cld: and sign in. You do this once per profile.\n' >&2
+  else
+    printf 'cld: %s was not usable, so "default" starts empty.\n' "$existing" >&2
+  fi
+}
+
+ensure_home() { bootstrap; mkdir_private "$CLD_HOME"; mkdir_private "$CLD_PROFILES_DIR"; }
+
+shell_quote() { printf "'%s'\n" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+json_quote()  { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+# Text that came from outside cld, on its way to your terminal. Control
+# characters are escape sequences: a .cldrc out of a repo you cloned must not
+# be able to clear your screen or repaint the line that says which account
+# you are on.
+sanitize() { printf '%s' "$1" | tr -d '\000-\037\177' | cut -c1-200; }
+
+# Is this path yours, and closed to everyone else? Used before cld seeds a
+# command that Claude will run as you. It checks the path itself, not every
+# directory above it: an ancestor you do not own is somebody else's machine
+# policy, not something cld can meaningfully second-guess.
+path_is_private() {
+  [ -O "$1" ] || return 1
+  case "$(ls -ld "$1" 2>/dev/null | cut -c1-10)" in
+    ?????w????|????????w?) return 1 ;;
+  esac
+  return 0
+}
+
+seed_statusline() {
+  dst="$1/settings.json"
+  [ -e "$dst" ] && return 0
+  root="$(repo_root)"
+  script="$root/bin/cld-statusline"
+  [ -f "$script" ] || return 0
+  # This command runs from your Claude prompt, on every prompt. Out of a
+  # checkout other people can write to, that is their code running as you.
+  if ! path_is_private "$root" || ! path_is_private "$script"; then
+    printf 'cld: %s is writable by others; skipping the status line\n' "$(sanitize "$root")" >&2
+    return 0
+  fi
+  # A control character cannot be represented raw in a JSON string. Seeding it
+  # would leave the profile with a settings.json Claude cannot parse at all,
+  # so skip the status line rather than break every other setting.
+  case "$script" in
+    *[[:cntrl:]]*)
+      printf 'cld: the source path holds a control character; skipping the status line\n' >&2
+      return 0 ;;
+  esac
+  cmd="$(json_quote "sh $(shell_quote "$script")")"
+  cat > "$dst" <<EOF
+{
+  "statusLine": {
+    "type": "command",
+    "command": "$cmd"
+  }
+}
+EOF
+}
+
+read_default() {
+  [ -f "$CLD_DEFAULT_FILE" ] || return 0
+  name="$(sed -n '1p' "$CLD_DEFAULT_FILE" | tr -d '\r\n')"
+  [ -n "$name" ] || return 0
+  profile_exists "$name" || return 0
+  printf '%s\n' "$name"
+}
+
+# There must always be a default. If the current one is gone, adopt the first
+# profile we can find.
+repair_default() {
+  [ -n "$(read_default)" ] && return 0
+  for d in "$CLD_PROFILES_DIR"/*; do
+    [ -d "$d" ] || continue
+    basename "$d" > "$CLD_DEFAULT_FILE"
+    return 0
+  done
+  rm -f "$CLD_DEFAULT_FILE"
+}
+
+# Read the profile name out of a marker file: first line that is not empty
+# and does not start with '#'. The file belongs to whatever repo you cloned,
+# so the value is sanitized before anyone can print it.
+read_marker() {
+  # A bounded read. The file comes out of whatever repo you cloned, and this
+  # runs on every cd: without the cap, a .cldrc that is one huge line is read
+  # into memory in full - 200MB of it cost 26s and 1GB of RSS, with the shell
+  # blocked for the duration. No profile name is anywhere near 4096 bytes.
+  sanitize "$(head -c 4096 "$1" \
+    | sed -e 's/\r$//' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    | grep -v '^#' \
+    | grep -v '^$' \
+    | head -n 1)"
+}
+
+# The marker file for a directory - that directory ONLY. cld does not walk up.
+# A .cldrc governs the folder it sits in, so nothing you merely happen to be
+# working under (/tmp, $HOME, /) can quietly choose which account you use.
+marker_for() {
+  dir="$1"
+  [ -d "$dir" ] || return 0
+  dir="$(cd "$dir" 2>/dev/null && pwd -P)" || return 0
+  # The path becomes one line in the trust file, so it has to be one line.
+  case "$dir" in *[[:cntrl:]]*) return 0 ;; esac
+  m="$dir/$CLD_MARKER"
+  [ -f "$m" ] || return 0
+  # A symlink is not the file you tested. Both -f and -O follow it, so without
+  # this, somebody else's link pointed at a file you happen to own would pass
+  # the ownership check below.
+  if [ -L "$m" ]; then
+    printf 'cld: ignoring %s: it is a symlink\n' "$(sanitize "$m")" >&2
+    return 0
+  fi
+  # Somebody else's file is not your configuration, and neither is a file in
+  # somebody else's directory: whoever owns the directory can replace what is
+  # in it. On a shared machine anyone can drop a .cldrc into a world-writable
+  # folder you work in.
+  if [ ! -O "$m" ] || [ ! -O "$dir" ]; then
+    printf 'cld: ignoring %s: it is not owned by you\n' "$(sanitize "$m")" >&2
+    return 0
+  fi
+  printf '%s\n' "$m"
+}
+
+# --- commands the shell integration calls (not in the help on purpose) -----
+
+# resolve [--marker] [dir]
+#   --marker prints only what a .cldrc says, with no fallback to the default.
+cmd_resolve() {
+  ensure_home
+  marker_only=0
+  if [ "${1:-}" = "--marker" ]; then marker_only=1; shift; fi
+  dir="${1:-$PWD}"
+  marker="$(marker_for "$dir")"
+  if [ -n "$marker" ]; then
+    name="$(read_marker "$marker")"
+    if [ -n "$name" ]; then
+      if ! valid_name "$name"; then
+        printf 'cld: %s names an invalid profile: %s\n' "$(sanitize "$marker")" "$name" >&2
+      elif ! profile_exists "$name"; then
+        printf 'cld: %s wants profile "%s", which does not exist\n' "$(sanitize "$marker")" "$name" >&2
+        printf 'cld: create it with:  cld add %s\n' "$name" >&2
+      else
+        printf '%s\n' "$name"
+        return 0
+      fi
+    fi
+  fi
+  [ "$marker_only" = "1" ] && return 0
+  read_default
+}
+
+cmd_dir() {
+  ensure_home
+  if [ $# -eq 0 ]; then
+    name="$(cmd_resolve "$PWD")"
+    [ -n "$name" ] || return 0
+  else
+    name="$1"
+  fi
+  valid_name "$name" || die "invalid profile name: $name"
+  profile_exists "$name" || die "no such profile: $name"
+  profile_dir "$name"
+}
+
+# --- the commands in the help ---------------------------------------------
+
+cmd_add() {
+  [ $# -ge 1 ] || die "usage: cld add <name>"
+  ensure_home
+  valid_name "$1" || die "invalid profile name: $1 (allowed: letters, digits, . _ -)"
+  if profile_exists "$1"; then
+    printf 'cld: profile %s already exists\n' "$1"
+    return 0
+  fi
+  dir="$(profile_dir "$1")"
+  mkdir_private "$dir"
+  seed_statusline "$dir"
+  repair_default
+  printf 'cld: created profile %s\n' "$1"
+  printf 'cld: use it with:  cld use %s   then run claude and sign in\n' "$1"
+}
+
+cmd_rc() {
+  [ $# -ge 1 ] || die "usage: cld rc <name> [dir]"
+  ensure_home
+  profile_exists "$1" || die "no such profile: $1 (make it with: cld add $1)"
+  target="${2:-$PWD}"
+  [ -d "$target" ] || die "not a directory: $target"
+  # marker_for refuses to READ a symlinked .cldrc, so writing through one is
+  # never what you want: > follows the link and truncates whatever is on the
+  # far end, and the file it leaves behind is then ignored anyway.
+  [ -L "$target/$CLD_MARKER" ] && die "$target/$CLD_MARKER is a symlink; refusing to write through it"
+  printf '%s\n' "$1" > "$target/$CLD_MARKER"
+  printf 'cld: %s now uses profile %s\n' "$target" "$1"
+  printf 'cld: wrote %s/%s\n' "$target" "$CLD_MARKER"
+}
+
+cmd_list() {
+  ensure_home
+  active="${CLD_PROFILE:-}"
+  default="$(read_default)"
+  found=0
+  for dir in "$CLD_PROFILES_DIR"/*; do
+    [ -d "$dir" ] || continue
+    found=1
+    name="$(basename "$dir")"
+    mark="  "
+    [ "$name" = "$active" ] && mark="* "
+    suffix=""
+    [ "$name" = "$default" ] && suffix=" (default)"
+    link=""
+    [ -L "$dir" ] && link=" -> $(readlink "$dir")"
+    printf '%s%s%s%s\n' "$mark" "$name" "$suffix" "$link"
+  done
+  [ "$found" = "1" ] || printf 'cld: no profiles yet. Make one with: cld add work\n'
+}
+
+cmd_move() {
+  [ $# -ge 2 ] || die "usage: cld move <old> <new>"
+  ensure_home
+  profile_exists "$1" || die "no such profile: $1"
+  valid_name "$2" || die "invalid profile name: $2 (allowed: letters, digits, . _ -)"
+  [ "$1" = "$2" ] && { printf 'cld: %s is already called that\n' "$1"; return 0; }
+  profile_exists "$2" && die "a profile called $2 already exists"
+  mv "$(profile_dir "$1")" "$(profile_dir "$2")"
+  if [ "$(sed -n 1p "$CLD_DEFAULT_FILE" 2>/dev/null)" = "$1" ]; then
+    printf '%s\n' "$2" > "$CLD_DEFAULT_FILE"
+  fi
+  repair_default
+  printf 'cld: moved %s to %s\n' "$1" "$2"
+  printf 'cld: any %s that says "%s" now points at nothing\n' "$CLD_MARKER" "$1" >&2
+}
+
+cmd_remove() {
+  [ $# -ge 1 ] || die "usage: cld remove <name>"
+  ensure_home
+  profile_exists "$1" || die "no such profile: $1"
+  dir="$(profile_dir "$1")"
+  if [ "${CLD_YES:-}" != "1" ]; then
+    printf 'cld: this deletes %s, including that account login.\n' "$dir" >&2
+    printf 'cld: re-run with CLD_YES=1 to confirm.\n' >&2
+    exit 1
+  fi
+  # rm -rf on a symlink removes the link only, never the directory it points at.
+  rm -rf "$dir"
+  printf 'cld: removed profile %s\n' "$1"
+  repair_default
+}
+
+# help doubles as status: the command list, then what is active here and
+# where everything lives. The profile list is `cld list`, not this.
+cmd_help() {
+  ensure_home
+  usage
+  if [ -n "${CLD_PROFILE:-}" ]; then
+    here="$CLD_PROFILE"
+  else
+    here="$(cmd_resolve "$PWD")"
+    [ -n "$here" ] && here="$here (not active in this shell yet)" || here="<none>"
+  fi
+  ccd="${CLAUDE_CONFIG_DIR:-<unset>}"
+  # Show where it really goes, the same way `cld list` does, so a linked
+  # profile does not look like two different places.
+  [ -L "${CLAUDE_CONFIG_DIR:-}" ] && ccd="$ccd -> $(readlink "$CLAUDE_CONFIG_DIR")"
+  printf '\n'
+  printf 'active here       %s\n' "$here"
+  printf 'CLAUDE_CONFIG_DIR %s\n' "$ccd"
+  printf '\n'
+  printf 'profiles stored   %s\n' "$CLD_PROFILES_DIR"
+  printf 'default profile   %s\n' "$(read_default)"
+  printf 'cld version       %s\n' "$CLD_VERSION"
+}
+
+cmd_uninstall() {
+  script="$(repo_root)/uninstall.sh"
+  [ -f "$script" ] || die "cannot find $script"
+  exec sh "$script" "$@"
+}
+
+usage() {
+  cat <<'USAGE'
+cld - one Claude Code account per terminal, and per project.
+
+Put a .cldrc file in a project holding one profile name, and every terminal
+in that folder uses that account. It applies to that folder itself, not to
+what is under it. Run claude as usual.
+
+  cld list                  Show all profiles. * is this terminal
+  cld add <name>            Create a profile
+  cld use <name>            Switch this terminal to a profile
+  cld rc <name> [dir]       Make a folder always use that profile
+  cld move <old> <new>      Rename a profile
+  cld remove <name>         Delete a profile (needs CLD_YES=1)
+  cld uninstall             Remove cld and put your Claude setup back
+USAGE
+}
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift || true
+case "$cmd" in
+  list)      cmd_list "$@" ;;
+  add)       cmd_add "$@" ;;
+  rc)        cmd_rc "$@" ;;
+  move)      cmd_move "$@" ;;
+  remove)    cmd_remove "$@" ;;
+  uninstall) cmd_uninstall "$@" ;;
+  # used by the shell integration, not advertised
+  resolve)   cmd_resolve "$@" ;;
+  dir)       cmd_dir "$@" ;;
+  version|--version|-v) printf '%s\n' "$CLD_VERSION" ;;
+  use)
+    printf "cld: 'cld use' changes this shell, so it needs the shell hook.\n" >&2
+    printf 'cld: reinstall to add it:\n' >&2
+    printf 'cld:   curl -fsSL https://raw.githubusercontent.com/MariuszHenn/cld/main/install.sh | sh\n' >&2
+    exit 1 ;;
+  help|--help|-h) cmd_help ;;
+  *) printf 'cld: unknown command: %s\n\n' "$cmd" >&2; usage >&2; exit 1 ;;
+esac

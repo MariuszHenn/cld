@@ -1,0 +1,64 @@
+#!/usr/bin/env sh
+# cld-statusline - a Claude Code status line that shows which cld profile,
+# and which account, this terminal is on: the thing cld exists to track.
+#
+# `cld add` seeds new profiles to use this. To add it to a profile by hand,
+# point that profile's settings.json "statusLine" at this file.
+
+set -u
+
+input="$(cat)"
+[ -n "$input" ] || exit 0
+
+D=$(printf '\033[2m'); R=$(printf '\033[0m')
+B=$(printf '\033[34m'); C=$(printf '\033[36m')
+SEP="$D | $R"
+
+strip_escapes() { tr -d '\000-\037\177' | cut -c1-64 | head -n 1; }
+
+jval() {
+  printf '%s' "$input" \
+    | sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -n 1
+}
+
+cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+profile="${CLD_PROFILE:-}"
+[ -n "$profile" ] || profile="$(basename "$cfg")"
+
+# The account: read the email straight out of this profile's .claude.json.
+email=""
+[ -f "$cfg/.claude.json" ] && email="$(
+  sed -n 's/.*"emailAddress"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$cfg/.claude.json" | head -n 1 | strip_escapes
+)"
+
+profile="$(printf '%s' "$profile" | strip_escapes)"
+model="$(jval display_name | strip_escapes)"
+dir="$(jval current_dir)"; [ -n "$dir" ] || dir="$(jval cwd)"
+
+# Walk up for a git branch. A repo really does extend to its subfolders, so
+# this walks even though .cldrc lookup does not.
+branch=""
+probe="$dir"
+while [ -n "$probe" ] && [ "$probe" != "/" ] && [ "$probe" != "." ]; do
+  if [ -f "$probe/.git/HEAD" ]; then
+    ref="$(head -c 512 "$probe/.git/HEAD" 2>/dev/null | strip_escapes)"
+    case "$ref" in
+      "ref: refs/heads/"*) branch="${ref#ref: refs/heads/}" ;;
+      ?*)                  branch="$(printf '%s' "$ref" | cut -c1-7)" ;;
+    esac
+    break
+  fi
+  probe="$(dirname "$probe")"
+done
+
+out="$B$profile$R"
+[ -n "$email" ] && out="$out$D $email$R"
+[ -n "$model" ] && out="$out$SEP$C$model$R"
+if [ -n "$dir" ]; then
+  out="$out$SEP$(basename "$dir" | strip_escapes)"
+  [ -n "$branch" ] && out="$out$D@$R$branch"
+fi
+
+printf '%s' "$out"
